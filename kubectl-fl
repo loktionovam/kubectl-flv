@@ -1,0 +1,81 @@
+#!/bin/bash
+
+if [[ -z "$1" ]]; then
+    echo "Usage: kubectl fl <pod-name-filter>"
+    exit 1
+fi
+
+# Run stern and pipe to fzf for interactive log filtering
+stern --template '{{ .NodeName }} {{color .PodColor .PodName}} {{color .ContainerColor .ContainerName}} {{.Message}} {{"\n"}}' --color always 2>&1 "$@" |
+    fzf --no-mouse --ansi --tail 100000 --tac --no-sort --wrap --preview-window=down:40% \
+    --preview="
+        # Get pod information once
+        pod_json=\$(kubectl get pod {2} -o json) ; \
+        # Extract pod details
+        pod_name=\$(echo \"\$pod_json\" | jq -r '.metadata.name') ; \
+        pod_phase=\$(echo \"\$pod_json\" | jq -r '.status.phase') ; \
+        pod_ip=\$(echo \"\$pod_json\" | jq -r '.status.podIP') ; \
+        pod_images=\$(echo \"\$pod_json\" | jq -r '.spec.containers[].image') ; \
+        pod_labels=\$(echo \"\$pod_json\" | jq '.metadata.labels') ; \
+        namespace=\$(echo \"\$pod_json\" | jq -r '.metadata.namespace') ; \
+        # Display pod information
+        echo -e \"\e[1mPod Information:\e[0m\" ; \
+        echo -e \"Name:    \$pod_name\" ; \
+        echo -e \"Phase:   \$pod_phase\" ; \
+        echo -e \"IP:      \$pod_ip\" ; \
+        echo -e \"Images:  \$pod_images\" ; \
+        echo ; \
+        # Get node name
+        node_name=\$(echo \"\$pod_json\" | jq -r '.spec.nodeName') ; \
+        # Get node information
+        node_json=\$(kubectl get node \"\$node_name\" -o json) ; \
+        node_ip=\$(echo \"\$node_json\" | jq -r '.status.addresses[] | select(.type==\"InternalIP\") | .address') ; \
+        os_image=\$(echo \"\$node_json\" | jq -r '.status.nodeInfo.osImage') ; \
+        kubelet_version=\$(echo \"\$node_json\" | jq -r '.status.nodeInfo.kubeletVersion') ; \
+        # Display node information
+        echo -e \"\e[1mNode Information:\e[0m\" ; \
+        echo -e \"Name:            \$node_name\" ; \
+        echo -e \"Internal IP:     \$node_ip\" ; \
+        echo -e \"OS Image:        \$os_image\" ; \
+        echo -e \"Kubelet Version: \$kubelet_version\" ; \
+        echo ; \
+        # Find services whose selectors match the pod's labels
+        services=\$(kubectl get svc -n \"\$namespace\" -o json | jq -r --argjson podLabels \"\$pod_labels\" '
+            .items[]
+            | select(.spec.selector != null)
+            | select(
+                (.spec.selector | to_entries | all(
+                    .key as \$k | .value == (\$podLabels[\$k] // null)
+                ))
+            )
+            | \"Name: \(.metadata.name)\\nType: \(.spec.type)\\nClusterIP: \(.spec.clusterIP)\\nPorts: \(.spec.ports | map(.port) | join(\", \"))\\n\(
+                if .spec.type == \"LoadBalancer\" and .status.loadBalancer.ingress != null then
+                    \"External IPs: \(.status.loadBalancer.ingress | map(.ip // .hostname) | join(\", \"))\\n\"
+                else
+                    \"\"
+                end
+            )\"
+        ') ; \
+        # Display services information
+        echo -e \"\e[1mAssociated Services:\e[0m\" ; \
+        if [ -z \"\$services\" ]; then \
+            echo \"No services found for pod \$pod_name.\"; \
+        else \
+            echo -e \"\$services\"; \
+        fi ; \
+        # Display resource usage
+        echo ; \
+        echo -e \"\e[1mResource Usage:\e[0m\" ; \
+        kubectl top pod {2} --containers ; \
+        echo ; \
+        kubectl top node \"\$node_name\" ; \
+        echo ; \
+        # Display pod lineage
+        echo -e \"\e[1mPod Lineage:\e[0m\" ; \
+        kubectl lineage pod {2} -D -o wide; \
+        echo
+    " \
+    --bind 'enter:execute:kubectl exec -it {2} -- bash' \
+    --bind 'ctrl-n:execute:(kubectl describe node $(kubectl get pod {2} -o jsonpath="{.spec.nodeName}")) | fzf --ansi --tail 100000 --tac --no-sort --wrap' \
+    --bind 'ctrl-i:execute:kubectl describe pod {2} | fzf --preview="kubectl get pod -o yaml {2}"' \
+    --header '╱ Enter (kubectl exec) ╱ CTRL-I (Pod Info) ╱ CTRL-N (Node Info)'

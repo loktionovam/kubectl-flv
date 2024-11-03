@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+
+if [[ -z "$1" ]]; then
+    echo "Usage: kubectl flv <pod-name-filter> <stern-additional-parameters>"
+    exit 1
+fi
+
+services_file=$(mktemp)
+ingresses_file=$(mktemp)
+nodes_file=$(mktemp)
+
+current_namespace=$(kubectl config view --minify --output 'jsonpath={..namespace}')
+current_namespace=${current_namespace:-default}
+
+kubectl get svc -n "$current_namespace" -o json 2>/dev/null > "$services_file"
+kubectl get ingress -n "$current_namespace" -o json 2>/dev/null > "$ingresses_file"
+kubectl get nodes -o json 2>/dev/null > "$nodes_file"
+
+# Validate JSON data
+for file in "$services_file" "$ingresses_file" "$nodes_file"; do
+    if ! jq empty "$file" >/dev/null 2>&1; then
+        echo "Error: Invalid JSON data in $(basename "$file")."
+        rm "$services_file" "$ingresses_file" "$nodes_file"
+        exit 1
+    fi
+done
+
+# Run stern and pipe to fzf for interactive log filtering
+stern --namespace "$current_namespace" --template '{{ .NodeName }} {{color .PodColor .PodName}} {{color .ContainerColor .ContainerName}} {{.Message}}{{"\n"}}' --color always 2>&1 "$@" |
+    fzf --no-mouse --ansi --tac --no-sort --wrap --preview-window=down:40% \
+    --preview="bash kubectl-fl-preview {2} $current_namespace $services_file $ingresses_file $nodes_file" \
+    --bind 'enter:execute:kubectl exec -it {2} -n "$current_namespace" -- bash' \
+    --bind 'ctrl-n:execute:(kubectl describe node $(kubectl get pod {2} -n "$current_namespace" -o jsonpath="{.spec.nodeName}")) | fzf --ansi --tac --no-sort --wrap' \
+    --bind 'ctrl-i:execute:kubectl describe pod {2} -n "$current_namespace" | fzf --preview="kubectl get pod {2} -n \"$current_namespace\" -o yaml"' \
+    --header '╱ Enter (kubectl exec) ╱ CTRL-I (Pod Info) ╱ CTRL-N (Node Info) / SHIFT-UP (Scroll preview UP) / SHIFT-DOWN (Scroll preview DOWN) /'
+
+rm "$services_file" "$ingresses_file" "$nodes_file"

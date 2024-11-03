@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+
+pod_name="$1"
+current_namespace="$2"
+services_file="$3"
+ingresses_file="$4"
+nodes_file="$5"
+
+# Fetch pod JSON
+pod_json=$(kubectl get pod "$pod_name" -n "$current_namespace" -o json 2>/dev/null)
+if [ -z "$pod_json" ] || [ "$pod_json" = "null" ]; then
+    echo "Error: Pod $pod_name not found in namespace $current_namespace."
+    exit 1
+fi
+
+# Extract pod details
+pod_phase=$(echo "$pod_json" | jq -r '.status.phase')
+pod_ip=$(echo "$pod_json" | jq -r '.status.podIP')
+pod_images=$(echo "$pod_json" | jq -r '.spec.containers[].image')
+pod_labels=$(echo "$pod_json" | jq '.metadata.labels')
+
+boldon=$(tput smso)
+boldoff=$(tput rmso)
+
+echo -e "${boldon}Pod Information:${boldoff}"
+echo -e "Name:      $pod_name"
+echo -e "Namespace: $current_namespace"
+echo -e "Phase:     $pod_phase"
+echo -e "IP:        $pod_ip"
+echo -e "Images:    $pod_images"
+echo
+
+# Node information
+node_name=$(echo "$pod_json" | jq -r '.spec.nodeName')
+node_json=$(jq --arg node_name "$node_name" '.items[] | select(.metadata.name == $node_name)' "$nodes_file")
+
+if [ -z "$node_json" ]; then
+    echo "Error: Node $node_name not found."
+else
+    node_ip=$(echo "$node_json" | jq -r '.status.addresses[] | select(.type=="InternalIP") | .address')
+    os_image=$(echo "$node_json" | jq -r '.status.nodeInfo.osImage')
+    kubelet_version=$(echo "$node_json" | jq -r '.status.nodeInfo.kubeletVersion')
+    echo -e "${boldon}Node Information:${boldoff}"
+    echo -e "Name:            $node_name"
+    echo -e "Internal IP:     $node_ip"
+    echo -e "OS Image:        $os_image"
+    echo -e "Kubelet Version: $kubelet_version"
+    echo
+fi
+
+# Services associated with pod
+matching_services=$(jq --argjson podLabels "$pod_labels" '.items[] | select(.spec.selector != null) | select((.spec.selector | to_entries | all(.key as $k | .value == ($podLabels[$k] // null))))' "$services_file")
+echo -e "${boldon}Associated Services:${boldoff}"
+if [ -z "$matching_services" ]; then
+    echo "No services found for pod $pod_name."
+else
+    echo "$matching_services" | jq -r '. | "Name: \(.metadata.name)\nType: \(.spec.type)\nClusterIP: \(.spec.clusterIP)\nPorts: \(.spec.ports | map(.port // .targetPort) | join(", "))\n"'
+fi
+
+# Resource usage
+echo
+echo -e "${boldon}Resource Usage:${boldoff}"
+kubectl top pod "$pod_name" -n "$current_namespace" --containers 2>/dev/null
+echo
+kubectl top node "$node_name" 2>/dev/null
+echo
+
+# Ingress resources associated with services
+service_names=($(echo "$matching_services" | jq -r '.metadata.name'))
+svc_names_json=$(printf '%s\n' "${service_names[@]}" | jq -R . | jq -s .)
+ingress_info=$(jq -r --argjson svcNames "$svc_names_json" '
+    .items[] |
+    select([ .spec.rules[]?.http.paths[]?.backend.service?.name, .spec.rules[]?.http.paths[]?.backend.serviceName ] | any(. as $svc | $svcNames | index($svc))) |
+    "Name: \(.metadata.name)\nHosts: \([.spec.rules[]?.host | select(. != null)] | unique | join(", "))\nPaths:\n\(
+        [.spec.rules[]?.http.paths[]? | "- " + (.path // "") + " => " + (
+            (.backend.service?.name // .backend.serviceName) + ":" + 
+            ((.backend.service?.port?.number // .backend.servicePort) | tostring)
+        )] | join("\n")
+    )\n"' "$ingresses_file")
+
+echo -e "${boldon}Associated Ingresses:${boldoff}"
+if [ -z "$ingress_info" ]; then
+    echo "No ingress resources found in namespace $current_namespace."
+else
+    echo -e "$ingress_info"
+fi
+
+echo
+# Pod lineage (optional)
+if command -v kubectl-lineage >/dev/null 2>&1; then
+    echo -e "${boldon}Pod Lineage:${boldoff}"
+    kubectl lineage pod "$pod_name" -n "$current_namespace" -D -o wide
+fi

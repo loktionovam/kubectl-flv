@@ -1,3 +1,9 @@
 #!/bin/bash
 
-cp kubectl-fl $HOME/.krew/bin/
+if [ -d "$HOME/.krew/bin/" ]; then
+    INSTALL_DIR="$HOME/.krew/bin/"
+    cp -av kubectl-flv kubectl-flv-preview "$INSTALL_DIR"
+else
+    INSTALL_DIR=/usr/local/bin/
+    sudo cp -av kubectl-flv kubectl-flv-preview "$INSTALL_DIR"
+fi

@@ -28,7 +28,7 @@ done
 # Run stern and pipe to fzf for interactive log filtering
 stern --namespace "$current_namespace" --template '{{ .NodeName }} {{color .PodColor .PodName}} {{color .ContainerColor .ContainerName}} {{.Message}}{{"\n"}}' --color always 2>&1 "$@" |
     fzf --no-mouse --ansi --tac --no-sort --wrap --preview-window=down:40% \
-    --preview="bash kubectl-fl-preview {2} $current_namespace $services_file $ingresses_file $nodes_file" \
+    --preview="bash kubectl-flv-preview {2} $current_namespace $services_file $ingresses_file $nodes_file" \
     --bind 'enter:execute:kubectl exec -it {2} -n "$current_namespace" -- bash' \
     --bind 'ctrl-n:execute:(kubectl describe node $(kubectl get pod {2} -n "$current_namespace" -o jsonpath="{.spec.nodeName}")) | fzf --ansi --tac --no-sort --wrap' \
     --bind 'ctrl-i:execute:kubectl describe pod {2} -n "$current_namespace" | fzf --preview="kubectl get pod {2} -n \"$current_namespace\" -o yaml"' \

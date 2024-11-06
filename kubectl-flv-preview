@@ -16,7 +16,7 @@ fi
 # Extract pod details
 pod_phase=$(echo "$pod_json" | jq -r '.status.phase')
 pod_ip=$(echo "$pod_json" | jq -r '.status.podIP')
-pod_images=$(echo "$pod_json" | jq -r '.spec.containers[].image')
+pod_containers=$(echo "$pod_json" | jq -r '.spec.containers[] | "\\t\(.name): \(.image)"')
 pod_labels=$(echo "$pod_json" | jq '.metadata.labels')
 
 boldon=$(tput smso)
@@ -27,7 +27,7 @@ echo -e "Name:      $pod_name"
 echo -e "Namespace: $current_namespace"
 echo -e "Phase:     $pod_phase"
 echo -e "IP:        $pod_ip"
-echo -e "Images:    $pod_images"
+echo -e "Containers and Images:\n$pod_containers"
 echo
 
 # Node information
@@ -88,6 +88,6 @@ fi
 echo
 # Pod lineage (optional)
 if command -v kubectl-lineage >/dev/null 2>&1; then
-    echo -e "${boldon}Pod Lineage:${boldoff}"
+    echo -e "${boldon}Pod Lineage (may take a while):${boldoff}"
     kubectl lineage pod "$pod_name" -n "$current_namespace" -D -o wide
 fi

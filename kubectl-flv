@@ -1,17 +1,111 @@
 #!/usr/bin/env bash
 
-if [[ -z "$1" ]]; then
-    echo "Usage: kubectl flv <pod-name-filter> <stern-additional-parameters>"
-    exit 1
+set -o pipefail
+
+help_message="
+Usage: $(basename "$0") [OPTIONS] [POD_NAME_PATTERN]
+
+A script to interactively follow logs of Kubernetes pods using stern and fzf.
+
+Options:
+  --fzf             Use fzf for interactive pod selection.
+  -n, --namespace   Specify the Kubernetes namespace to use.
+  -h, --help        Display this help message and exit.
+
+Examples:
+  # Follow logs of all pods in the current namespace
+  $(basename "$0")
+
+  # Follow logs of pods matching a pattern in a specific namespace
+  $(basename "$0") -n my-namespace pod-name-pattern
+
+  # Use interactive pod selection with fzf
+  $(basename "$0") --fzf
+
+  # Use interactive pod selection with fzf in a specific namespace
+  $(basename "$0") --fzf -n my-namespace
+
+Keybindings in fzf:
+  Enter            Execute 'kubectl exec' into the selected pod.
+  Ctrl-I           Show Pod Info.
+  Ctrl-N           Show Node Info.
+  Ctrl-F           Toggle following logs.
+  Ctrl-P           Toggle Preview window.
+  Shift-Up/Down    Scroll the Preview window.
+"
+
+current_namespace=$(kubectl config view --minify --output 'jsonpath={..namespace}')
+current_namespace=${current_namespace:-default}
+
+# Default value for fzf selection
+use_fzf=false
+
+# Arrays to hold stern parameters and pod name filters
+stern_params=()
+pod_filters=()
+
+# Parse command-line arguments
+while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+        --fzf)
+            use_fzf=true
+            shift
+            ;;
+        --namespace|-n)
+            # Handle namespace parameter
+            stern_params+=("$arg" "$2")
+            current_namespace="$2"
+            shift 2
+            ;;
+        --namespace=*|-n=*)
+            # Handle namespace parameter with '='
+            stern_params+=("$arg")
+            current_namespace="${arg#*=}"
+            shift
+            ;;
+        -h|--help)
+            echo "$help_message"
+            exit 0
+            ;;
+        *)
+            # Pass all other arguments to stern
+            stern_params+=("$arg")
+            shift
+            ;;
+    esac
+done
+
+
+if $use_fzf; then
+    # Use kubectl to get pods with additional information
+    pods=$(kubectl get pods -n "$current_namespace" --no-headers \
+      -o custom-columns=\
+NAME:.metadata.name,\
+STATUS:.status.phase,\
+POD_IP:.status.podIP,\
+NODE_NAME:.spec.nodeName,\
+NODE_IP:.status.hostIP)
+
+    # Start fzf for pod selection
+    selected_pods=$(echo "$pods" | fzf --multi --ansi --tac --no-sort --wrap \
+        --header 'Select pod(s) to follow logs' --prompt='Pod> ' | awk '{print $1}')
+
+    if [[ -z "$selected_pods" ]]; then
+        echo "No pods selected. Exiting."
+        exit 1
+    fi
+    regex=$(echo "$selected_pods" | paste -sd '|' -)
+    pod_filters+=("^($regex)$")
 fi
 
 services_file=$(mktemp)
 ingresses_file=$(mktemp)
 nodes_file=$(mktemp)
+follow_state_file=$(mktemp)
+echo "On" > "$follow_state_file"
 
-current_namespace=$(kubectl config view --minify --output 'jsonpath={..namespace}')
-current_namespace=${current_namespace:-default}
-
+# Initial population of JSON data
 kubectl get svc -n "$current_namespace" -o json 2>/dev/null > "$services_file"
 kubectl get ingress -n "$current_namespace" -o json 2>/dev/null > "$ingresses_file"
 kubectl get nodes -o json 2>/dev/null > "$nodes_file"
@@ -20,18 +114,99 @@ kubectl get nodes -o json 2>/dev/null > "$nodes_file"
 for file in "$services_file" "$ingresses_file" "$nodes_file"; do
     if ! jq empty "$file" >/dev/null 2>&1; then
         echo "Error: Invalid JSON data in $(basename "$file")."
-        rm "$services_file" "$ingresses_file" "$nodes_file"
+        rm -f "$services_file" "$ingresses_file" "$nodes_file" "$follow_state_file"
         exit 1
     fi
 done
 
-# Run stern and pipe to fzf for interactive log filtering
-stern --namespace "$current_namespace" --template '{{ .NodeName }} {{color .PodColor .PodName}} {{color .ContainerColor .ContainerName}} {{.Message}}{{"\n"}}' --color always 2>&1 "$@" |
-    fzf --no-mouse --ansi --tac --no-sort --wrap --preview-window=down:40% \
-    --preview="bash kubectl-flv-preview {2} $current_namespace $services_file $ingresses_file $nodes_file" \
-    --bind 'enter:execute:kubectl exec -it {2} -n "$current_namespace" -- bash' \
-    --bind 'ctrl-n:execute:(kubectl describe node $(kubectl get pod {2} -n "$current_namespace" -o jsonpath="{.spec.nodeName}")) | fzf --ansi --tac --no-sort --wrap' \
-    --bind 'ctrl-i:execute:kubectl describe pod {2} -n "$current_namespace" | fzf --preview="kubectl get pod {2} -n \"$current_namespace\" -o yaml"' \
-    --header '╱ Enter (kubectl exec) ╱ CTRL-I (Pod Info) ╱ CTRL-N (Node Info) / SHIFT-UP (Scroll preview UP) / SHIFT-DOWN (Scroll preview DOWN) /'
+# Start background process to update the files every minute
+{
+    while true; do
+        sleep 60
+        kubectl get svc -n "$current_namespace" -o json 2>/dev/null > "$services_file"
+        kubectl get ingress -n "$current_namespace" -o json 2>/dev/null > "$ingresses_file"
+        kubectl get nodes -o json 2>/dev/null > "$nodes_file"
+    done
+} &
+updater_pid=$!
 
-rm "$services_file" "$ingresses_file" "$nodes_file"
+# Function to clean up the stern process and background updater
+cleanup() {
+    {
+        if [ -n "$stern_pid" ]; then
+            # Resume the stern process if it is stopped
+            if ps -p "$stern_pid" -o state= | grep -q T; then
+                kill -CONT "$stern_pid"
+            fi
+            # Terminate the stern process
+            kill "$stern_pid"
+        fi
+        if [ -n "$updater_pid" ]; then
+            # Terminate the background updater process
+            kill "$updater_pid"
+        fi
+        # Remove temporary files
+        rm -f "$services_file" "$ingresses_file" "$nodes_file" "$toggle_script" "$follow_state_file" "$stern_fifo"
+    } >/dev/null 2>&1
+}
+trap cleanup EXIT
+
+# Ignore SIGPIPE to prevent the script from exiting prematurely
+trap '' SIGPIPE
+
+# Create a named pipe (FIFO) for stern's output
+stern_fifo=$(mktemp -u)
+mkfifo "$stern_fifo"
+
+# Start stern and redirect its output to the FIFO
+stern_cmd=(
+    stern
+    --namespace "$current_namespace"
+    --template '{{ .NodeName }} {{color .PodColor .PodName}} {{color .ContainerColor .ContainerName}} {{.Message}}{{"\n"}}'
+    --color always
+    "${stern_params[@]}"
+    "${pod_filters[@]}"
+)
+"${stern_cmd[@]}" 2>&1 > "$stern_fifo" &
+stern_pid=$!
+
+# Create a temporary script to toggle stern's execution
+toggle_script=$(mktemp)
+cat > "$toggle_script" << EOF
+#!/usr/bin/env bash
+follow_state_file="$follow_state_file"
+stern_pid="$stern_pid"
+if [ -n "\$stern_pid" ]; then
+    if ps -p "\$stern_pid" -o state= | grep -q T; then
+        kill -CONT "\$stern_pid"
+        echo "On" > "\$follow_state_file"
+    else
+        kill -STOP "\$stern_pid"
+        echo "Off" > "\$follow_state_file"
+    fi
+else
+    echo "Stern process not found."
+fi
+EOF
+chmod +x "$toggle_script"
+
+# Run fzf and read stern's output from the FIFO
+fzf --no-mouse --ansi --tac --no-sort --wrap --tail 100000 \
+  --preview-window=down:40% --preview-window hidden --info='inline' \
+  --preview='
+    follow_state=$(cat '"$follow_state_file"')
+    echo "Follow logs: $follow_state"
+    if [[ ! -z {2} ]]; then
+        bash kubectl-flv-preview {2} '"$current_namespace"' '"$services_file"' '"$ingresses_file"' '"$nodes_file"'
+    fi
+  ' \
+  --bind 'enter:execute:kubectl exec -it {2} -n '"$current_namespace"' -- bash' \
+  --bind 'ctrl-n:execute:(kubectl describe node $(kubectl get pod {2} -n '"$current_namespace"' -o jsonpath="{.spec.nodeName}")) | fzf --multi --ansi --tac --no-sort --wrap' \
+  --bind 'ctrl-i:execute:kubectl describe pod {2} -n '"$current_namespace"' | fzf --multi --preview="kubectl get pod {2} -n \"$current_namespace\" -o yaml"' \
+  --bind 'ctrl-f:execute-silent:'"$toggle_script"'' --bind 'ctrl-f:+refresh-preview' \
+  --bind change:clear-screen \
+  --bind 'ctrl-p:toggle-preview' \
+  --header '╱ Enter (kubectl exec) ╱ CTRL-I (Pod Info) ╱ CTRL-N (Node Info) ╱ CTRL-F (Toggle Follow) ╱ CTRL-P (Toggle Preview) / SHIFT-UP/DOWN (Scroll Preview) ╱' < "$stern_fifo"
+
+# Clean up resources
+cleanup

@@ -76,7 +76,6 @@ If you don’t have Krew installed, follow the [installation instructions](https
 
 ```bash
 kubectl krew install stern
-kubectl krew install top
 kubectl krew install lineage
 ```
 

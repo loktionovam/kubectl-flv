@@ -204,9 +204,12 @@ fzf --no-mouse --ansi --tac --no-sort --wrap --tail 100000 \
   --bind 'ctrl-n:execute:(kubectl describe node $(kubectl get pod {2} -n '"$current_namespace"' -o jsonpath="{.spec.nodeName}")) | fzf --multi --ansi --tac --no-sort --wrap' \
   --bind 'ctrl-i:execute:kubectl describe pod {2} -n '"$current_namespace"' | fzf --multi --preview="kubectl get pod {2} -n \"$current_namespace\" -o yaml"' \
   --bind 'ctrl-f:execute-silent:'"$toggle_script"'' --bind 'ctrl-f:+refresh-preview' \
+  --bind "ctrl-y:execute(
+        bash kubectl-flv-cm-view {2} $current_namespace 
+    )" \
   --bind change:clear-screen \
   --bind 'ctrl-p:toggle-preview' \
-  --header '╱ Enter (kubectl exec) ╱ CTRL-I (Pod Info) ╱ CTRL-N (Node Info) ╱ CTRL-F (Toggle Follow) ╱ CTRL-P (Toggle Preview) / SHIFT-UP/DOWN (Scroll Preview) ╱' < "$stern_fifo"
+  --header '╱ Enter (kubectl exec) ╱ CTRL-I (Pod Info) ╱ CTRL-Y (ConfigMaps) ╱ CTRL-N (Node Info) ╱ CTRL-F (Toggle Follow) ╱ CTRL-P (Toggle Preview) / SHIFT-UP/DOWN (Scroll Preview) ╱' < "$stern_fifo"
 
 # Clean up resources
 cleanup

@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+
+pod_name="$1"
+current_namespace="$2"
+
+# Ensure the script uses Bash
+if [ -z "$BASH_VERSION" ]; then
+    echo "This script requires Bash to run."
+    exit 1
+fi
+
+# Fetch pod JSON
+pod_json=$(kubectl get pod "$pod_name" -n "$current_namespace" -o json 2>/dev/null)
+if [ -z "$pod_json" ] || [ "$pod_json" = "null" ]; then
+    echo "Error: Pod $pod_name not found in namespace $current_namespace."
+    exit 1
+fi
+
+# Pre-fetch all ConfigMaps and Secrets in the namespace to avoid repeated kubectl calls
+all_configmaps_json=$(kubectl get configmap -n "$current_namespace" -o json)
+all_secrets_json=$(kubectl get secret -n "$current_namespace" -o json)
+
+get_configmap_data() {
+    local name="$1"
+    # Returns the .data object of the specified ConfigMap as JSON
+    echo "$all_configmaps_json" | jq -r --arg name "$name" '
+        .items[] | select(.metadata.name == $name) | .data
+    '
+}
+
+get_secret_data() {
+    local name="$1"
+    # Returns the .data object of the specified Secret as JSON
+    echo "$all_secrets_json" | jq -r --arg name "$name" '
+        .items[] | select(.metadata.name == $name) | .data
+    '
+}
+
+(
+printed_volumes=""
+
+# Process volumes with ConfigMaps and Secrets
+echo "$pod_json" | jq -r '
+  [.spec.volumes[]? | select(.configMap != null or .secret != null) | {
+      volume_name: .name,
+      source_type: (if .configMap != null then "ConfigMap" else "Secret" end),
+      source_name: (.configMap.name // .secret.secretName),
+      items: (.configMap.items // .secret.items // []),
+      default_mode: (.configMap.defaultMode // .secret.defaultMode // "default")
+  }] | unique_by(.volume_name) | .[]
+  | @base64
+' | while read -r line; do
+    decoded_line=$(echo "$line" | base64 --decode)
+    source_type=$(echo "$decoded_line" | jq -r '.source_type')
+    source_name=$(echo "$decoded_line" | jq -r '.source_name')
+    volume_name=$(echo "$decoded_line" | jq -r '.volume_name')
+    items=$(echo "$decoded_line" | jq -c '.items')
+    default_mode=$(echo "$decoded_line" | jq -r '.default_mode')
+
+    # Get mount path for the volume
+    mount_path=$(echo "$pod_json" | jq -r --arg volume_name "$volume_name" '
+        .spec.containers[].volumeMounts[]? | select(.name == $volume_name) | .mountPath
+    ' | head -n1)
+
+    # Get all containers that mount this volume
+    container_names=$(echo "$pod_json" | jq -r --arg volume_name "$volume_name" '
+        [ .spec.containers[] | select((.volumeMounts[]? | select(.name == $volume_name))) | .name ] | join(", ")
+    ')
+
+    # Check if the volume has already been printed
+    if echo "$printed_volumes" | grep -qw "$volume_name"; then
+        continue
+    else
+        printed_volumes="$printed_volumes $volume_name"
+    fi
+
+    if [[ "$items" == "[]" ]]; then
+        # No specific items; list all keys from the source
+        if [ "$source_type" = "ConfigMap" ]; then
+            data=$(get_configmap_data "$source_name")
+        else
+            data=$(get_secret_data "$source_name")
+        fi
+        keys=$(echo "$data" | jq -r 'keys[]' 2>/dev/null)
+        for key in $keys; do
+            echo "$source_type => $source_name => $key => Containers: [$container_names] => $mount_path/$key"
+        done
+    else
+        echo "$items" | jq -r --arg mount_path "$mount_path" --arg source_type "$source_type" --arg source_name "$source_name" --arg container_names "$container_names" '
+            .[] | "Containers: [\($container_names)] => \($source_type) => \($source_name) => \(.key) => \($mount_path)/\(.path // .key)"
+        '
+    fi
+done
+
+echo -e "\nConfigMaps and Secrets Used in Environment Variables:"
+
+# Process environment variables from ConfigMaps and Secrets
+echo "$pod_json" | jq -r '
+  .spec.containers[]? as $container |
+  (
+    # Process env[] entries with ConfigMaps
+    $container.env[]? | select(.valueFrom.configMapKeyRef != null) |
+    {
+      type: "EnvVar",
+      container_name: $container.name,
+      source_type: "ConfigMap",
+      source_name: .valueFrom.configMapKeyRef.name,
+      key: .valueFrom.configMapKeyRef.key,
+      variable_name: .name
+    } | @base64
+  ),
+  (
+    # Process env[] entries with Secrets
+    $container.env[]? | select(.valueFrom.secretKeyRef != null) |
+    {
+      type: "EnvVar",
+      container_name: $container.name,
+      source_type: "Secret",
+      source_name: .valueFrom.secretKeyRef.name,
+      key: .valueFrom.secretKeyRef.key,
+      variable_name: .name
+    } | @base64
+  ),
+  (
+    # Process envFrom[] entries with ConfigMaps
+    $container.envFrom[]? | select(.configMapRef != null) |
+    {
+      type: "EnvFrom",
+      container_name: $container.name,
+      source_type: "ConfigMap",
+      source_name: .configMapRef.name
+    } | @base64
+  ),
+  (
+    # Process envFrom[] entries with Secrets
+    $container.envFrom[]? | select(.secretRef != null) |
+    {
+      type: "EnvFrom",
+      container_name: $container.name,
+      source_type: "Secret",
+      source_name: .secretRef.name
+    } | @base64
+  )
+' | while read -r line; do
+    decoded_line=$(echo "$line" | base64 --decode)
+    type=$(echo "$decoded_line" | jq -r '.type')
+    source_type=$(echo "$decoded_line" | jq -r '.source_type')
+    source_name=$(echo "$decoded_line" | jq -r '.source_name')
+    container_name=$(echo "$decoded_line" | jq -r '.container_name')
+
+    if [ "$type" = "EnvVar" ]; then
+        key=$(echo "$decoded_line" | jq -r '.key')
+        variable_name=$(echo "$decoded_line" | jq -r '.variable_name')
+
+        if [ "$source_type" = "ConfigMap" ]; then
+            # Extract the value for the given key directly from the cached ConfigMap data
+            variable_value=$(get_configmap_data "$source_name" | jq -r --arg key "$key" '.[$key]')
+        else
+            # Extract the base64-encoded value from the cached Secret data and decode it
+            encoded_value=$(get_secret_data "$source_name" | jq -r --arg key "$key" '.[$key]')
+            variable_value=$(echo "$encoded_value" | base64 --decode)
+        fi
+
+        echo "EnvVar => $container_name => $source_type => $source_name => $key => $variable_name=$variable_value"
+    elif [ "$type" = "EnvFrom" ]; then
+        if [ "$source_type" = "ConfigMap" ]; then
+            data=$(get_configmap_data "$source_name")
+            echo "$data" | jq -c '. | to_entries[]' | while read -r entry; do
+                k=$(echo "$entry" | jq -r '.key')
+                v=$(echo "$entry" | jq -r '.value')
+                echo "EnvVar => $source_type => $source_name => $k=$v"
+            done
+        else
+            data=$(get_secret_data "$source_name")
+            echo "$data" | jq -c '. | to_entries[]' | while read -r entry; do
+                k=$(echo "$entry" | jq -r '.key')
+                v=$(echo "$entry" | jq -r '.value' | base64 --decode)
+                echo "EnvVar => $source_type => $source_name => $k=$v"
+            done
+        fi
+    fi
+done
+) | fzf --preview-window=down:70% --delimiter '=>' --tac \
+        --preview '
+            source_type={1}
+            source_name={2}
+            key={3}
+            if [ "$source_type" = "ConfigMap" ]; then
+                kubectl get configmap "$source_name" -n '"$current_namespace"' -o json | jq -r --arg key "$key" ".data[\$key]"
+            else
+                kubectl get secret "$source_name" -n '"$current_namespace"' -o json | jq -r --arg key "$key" ".data[\$key]" | base64 --decode
+            fi
+        ' \
+        --bind 'enter:execute(
+            source_type={1}
+            source_name={2}
+            key={3}
+            if [ "$source_type" = "ConfigMap" ]; then
+                kubectl get configmap "$source_name" -n '"$current_namespace"' -o json | jq -r --arg key "$key" ".data[\$key]" | fzf --tac
+            else
+                kubectl get secret "$source_name" -n '"$current_namespace"' -o json | jq -r --arg key "$key" ".data[\$key]" | base64 --decode | fzf  --tac
+            fi
+        )'

@@ -59,6 +59,7 @@ kubectl flv [OPTIONS] [POD_NAME_PATTERN] [STERN_ADDITIONAL_PARAMETERS]
 - **Ctrl-N**: Show Node Info.
 - **Ctrl-F**: Toggle following logs.
 - **Ctrl-P**: Toggle Preview window.
+- **Ctrl-Y**: Show ConfigMaps/Secrets inspector.
 - **Shift-Up/Down**: Scroll the Preview window.
 
 ## Prerequisites
